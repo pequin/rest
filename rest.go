@@ -23,7 +23,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -67,13 +66,11 @@ type api struct {
 	ibr time.Duration  // Interval between requests.
 	lms limiters       // Limits for endpoint requests.
 	crt int            // Count of  request.
+	tlc *tls.Config    // TLS config for dial; nil means the default. Tests set it.
 
 	tmp struct {
 		rsp *http.Response // Server response before parsing.
 		brd *bufio.Reader  // Used when parsing a response.
-		str string         // Used to temporarily store a string before parsing it into the desired type.
-		lrt time.Time      // The response time of the last request.
-		rap *response      // Response after parsing
 	}
 }
 
@@ -88,7 +85,6 @@ func NewAPI(endpoint string) (API, error) {
 	a.lms.init()
 
 	a.tmp.brd = bufio.NewReader(nil)
-	a.tmp.rap = &response{}
 
 	// Parsing the URL.
 	u, e := url.Parse(endpoint)
@@ -97,7 +93,7 @@ func NewAPI(endpoint string) (API, error) {
 		return nil, e
 	}
 
-	a.hst, _ = strings.CutPrefix(u.Host, "www.")
+	a.hst = u.Hostname()
 	a.prt = u.Port()
 
 	if a.prt == "" {
@@ -116,20 +112,19 @@ func NewAPI(endpoint string) (API, error) {
 
 		for csr := range a.csr {
 
-			a.tmp.rap.writte(a.send(csr))
+			rsp := &response{}
+			rsp.writte(a.send(csr))
 
-			a.cgr <- a.tmp.rap
+			a.cgr <- rsp
 		}
 	}()
 
 	// Setting the default headers.
-	a.hdr.Set("Host", a.hst)
+	a.hdr.Set("Host", u.Host)
 	a.hdr.Set("User-Agent", "github.com/pequin/rest")
 	a.hdr.Set("Content-Type", "application/json")
 	a.hdr.Set("Accept", "*/*")
 	a.hdr.Set("Connection", "keep-alive")
-	a.hdr.Add("Accept-Encoding", "deflate")
-	a.hdr.Add("Accept-Encoding", "br")
 
 	return a, nil
 }
@@ -138,15 +133,14 @@ func (a *api) dial() error {
 
 	var err error
 
-	a.con, err = tls.Dial("tcp", fmt.Sprintf("%s:%s", a.hst, a.prt), &tls.Config{
-		InsecureSkipVerify: false,
-	})
+	cfg := a.tlc
+	if cfg == nil {
+		cfg = &tls.Config{}
+	}
 
-	if err != nil && a.con != nil {
-		e := a.con.Close()
-		if e != nil {
-			return e
-		}
+	a.con, err = tls.Dial("tcp", a.host(), cfg)
+	if err != nil {
+		a.con = nil
 		return err
 	}
 
@@ -165,7 +159,7 @@ func (a *api) dial() error {
 }
 
 func (a *api) host() string {
-	return fmt.Sprintf("%s:%s", a.hst, a.prt)
+	return net.JoinHostPort(a.hst, a.prt)
 }
 
 func (a *api) send(r *request) ([]byte, error) {
@@ -190,17 +184,22 @@ func (a *api) send(r *request) ([]byte, error) {
 		}
 	}
 
-	if _, err = a.con.Write(r.encode()); err != nil {
+	raw := r.encode()
 
-		if e, f := err.(net.Error); (f && e.Timeout()) || errors.Is(err, net.ErrClosed) {
-			err = a.dial()
-			if err != nil {
-				return nil, err
-			}
-			a.send(r)
+	if _, err = a.con.Write(raw); err != nil {
+
+		var ne net.Error
+		if !(errors.As(err, &ne) && ne.Timeout()) && !errors.Is(err, net.ErrClosed) {
+			return nil, err
 		}
 
-		return nil, err
+		// The connection timed out or was closed: dial again and resend once.
+		if err = a.dial(); err != nil {
+			return nil, err
+		}
+		if _, err = a.con.Write(raw); err != nil {
+			return nil, err
+		}
 	}
 
 	err = a.con.SetDeadline(time.Now().Add(dead))
@@ -218,25 +217,13 @@ func (a *api) send(r *request) ([]byte, error) {
 	defer a.tmp.rsp.Body.Close()
 
 	if a.tmp.rsp.StatusCode != 200 {
+		// Drain the body so the next response starts at the right offset.
+		if _, err = io.Copy(io.Discard, a.tmp.rsp.Body); err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("status:%d of the response to the request:%s", a.tmp.rsp.StatusCode, r.url())
 	}
 
-	a.tmp.str = a.tmp.rsp.Header.Get("Date")
-
-	if len(a.tmp.str) > 0 {
-
-		a.tmp.lrt, err = time.Parse(time.RFC1123, a.tmp.str)
-		a.tmp.lrt = a.tmp.lrt.Truncate(time.Second)
-
-		if err != nil {
-			a.tmp.lrt = time.Now().Truncate(time.Second)
-		}
-
-	} else {
-		a.tmp.lrt = time.Now().Truncate(time.Second)
-	}
-
-	a.lms.requested(a.tmp.lrt, r.wgt)
 	a.crt++
 
 	return io.ReadAll(a.tmp.rsp.Body)

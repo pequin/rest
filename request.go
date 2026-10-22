@@ -66,9 +66,9 @@ func (r *request) encode() []byte {
 
 // Returns the path and parameters.
 func (r *request) path() string {
-	p := r.pth
+	p := "/" + strings.TrimPrefix(r.pth, "/")
 	if len(r.prm) > 0 {
-		p = fmt.Sprintf("/%s?%s", r.pth, r.prm.Encode())
+		p += "?" + r.prm.Encode()
 	}
 	return p
 }

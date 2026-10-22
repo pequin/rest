@@ -45,7 +45,8 @@ func (l *limiters) init() {
 
 }
 
-// Wait if the weight exceeded the permissible value.
+// Wait blocks until the weight fits into the current window and then
+// reserves it, so concurrent waiters cannot overshoot the limit together.
 func (l *limiter) wait(weight int) error {
 
 	if l.max < weight {
@@ -53,56 +54,35 @@ func (l *limiter) wait(weight int) error {
 	}
 
 	l.mtx.Lock()
-	if l.uwt+weight >= l.max {
-		l.cnd.Wait()
+	defer l.mtx.Unlock()
 
+	// A broadcast wakes every waiter, so each one has to check again.
+	for l.uwt+weight > l.max {
+		l.cnd.Wait()
 	}
 
-	l.mtx.Unlock()
+	l.uwt += weight
+
+	// Start the window timer once per window. The flag is set under the
+	// same lock that checks it, so two timers can never run at once.
+	if !l.ehb {
+		l.ehb = true
+		now := time.Now()
+		go l.reset(now.Truncate(l.per).Add(l.per).Sub(now))
+	}
 
 	return nil
 }
 
-// Starts a wait loop until the end of the period.
-func (l *limiter) until(timedata time.Time) {
-	l.mtx.Lock()
-	if !l.ehb {
-		l.mtx.Unlock()
-
-		go func() {
-			l.mtx.Lock()
-			l.ehb = true
-			l.mtx.Unlock()
-
-			time.Sleep(timedata.Truncate(l.per).Add(l.per).Sub(timedata))
-
-			l.mtx.Lock()
-			l.uwt = 0
-			l.ehb = false
-			l.cnd.Broadcast()
-			l.mtx.Unlock()
-		}()
-
-	} else {
-		l.mtx.Unlock()
-	}
-
-}
-
-func (l *limiter) requested(timedata time.Time, weight int) {
+// Reset clears the used weight when the current window ends.
+func (l *limiter) reset(after time.Duration) {
+	time.Sleep(after)
 
 	l.mtx.Lock()
-	l.uwt = l.uwt + weight
+	l.uwt = 0
+	l.ehb = false
+	l.cnd.Broadcast()
 	l.mtx.Unlock()
-	l.until(timedata)
-
-}
-
-// Save last request time and weight used for all limiter.
-func (l *limiters) requested(timedata time.Time, weight int) {
-	for i := range l.lms {
-		l.lms[i].requested(timedata, weight)
-	}
 }
 
 // Wait if the weight exceeded the permissible value questioning each restrictive.
