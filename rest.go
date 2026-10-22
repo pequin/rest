@@ -15,240 +15,369 @@
 package rest
 
 import (
-	"bufio"
-	"crypto/tls"
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"net"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
-const dead = time.Hour
+const (
+	// DefaultTimeout is the per-attempt timeout used when Options.Timeout is zero.
+	DefaultTimeout = 30 * time.Second
 
-type API interface {
+	// DefaultMaxBackoff is the longest pause between retries used when
+	// Options.MaxBackoff is zero.
+	DefaultMaxBackoff = 5 * time.Second
 
-	// Adds a request limit.
-	Limit(per time.Duration, limit int)
+	// DefaultUserAgent is sent when Options.UserAgent is empty.
+	DefaultUserAgent = "github.com/pequin/rest"
 
-	// Creates a new get request.
-	Get(path string, weight int) Request
+	baseBackoff = 100 * time.Millisecond
+)
 
-	// Set interval between requests
-	Interval(time.Duration)
+// Options configures a [Client]. The zero value is valid: no limits, no
+// retries, and a 30-second timeout per attempt.
+type Options struct {
+	// HTTPClient sends the requests. If nil, the client uses its own
+	// http.Client with a keep-alive transport cloned from
+	// http.DefaultTransport.
+	HTTPClient *http.Client
 
-	// Sets the base path for all requests.
-	// Base(string)
+	// Timeout bounds one attempt, from sending the request to reading the
+	// whole body. Zero means DefaultTimeout; a negative value disables it.
+	Timeout time.Duration
+
+	// Limits are the weight limits the server enforces. Each limit is a
+	// fixed window: at most Weight units per Per, counted from the start of
+	// the window on the server clock.
+	Limits []Limit
+
+	// Interval is the minimum time between the starts of two requests.
+	Interval time.Duration
+
+	// Header holds headers sent with every request. Headers set on a
+	// [Request] take precedence.
+	Header http.Header
+
+	// UserAgent replaces DefaultUserAgent.
+	UserAgent string
+
+	// MaxRetries is how many times an idempotent request is retried after a
+	// transport error or a 429, 500, 502, 503 or 504 response. Zero disables
+	// retries.
+	MaxRetries int
+
+	// MaxBackoff caps the pause between retries. Zero means
+	// DefaultMaxBackoff. A Retry-After header from the server is honored even
+	// when it is longer.
+	MaxBackoff time.Duration
+
+	// Sign, if set, is called on every attempt right before it is sent, for
+	// example to add a timestamp and a signature. An error from Sign stops
+	// the request.
+	Sign func(*http.Request) error
 }
 
-type response struct {
-	data []byte
-	error
+// Limit is one weight limit, such as "1200 weight per minute".
+type Limit struct {
+	Per    time.Duration // Window length; must be positive.
+	Weight int           // Total weight allowed in one window; must be positive.
 }
 
-func (r *response) read() ([]byte, error) {
-	return r.data, r.error
-}
-func (r *response) writte(data []byte, err error) {
-	r.data = data
-	r.error = err
+// Client sends requests to one base URL and keeps them within the configured
+// limits. It is safe for concurrent use by multiple goroutines.
+type Client struct {
+	base       *url.URL
+	http       *http.Client
+	header     http.Header
+	timeout    time.Duration
+	maxRetries int
+	maxBackoff time.Duration
+	sign       func(*http.Request) error
+	limiter    *limiter
 }
 
-type api struct {
-	con *tls.Conn      // Connection to endpoint.
-	csr chan *request  // Channel for sending requests.
-	cgr chan *response // Channel for getting response
-	hst string         // Host.
-	prt string         // Port number.
-	hdr http.Header    // Default headers applied to all requests.
-	ibr time.Duration  // Interval between requests.
-	lms limiters       // Limits for endpoint requests.
-	crt int            // Count of  request.
-	tlc *tls.Config    // TLS config for dial; nil means the default. Tests set it.
-
-	tmp struct {
-		rsp *http.Response // Server response before parsing.
-		brd *bufio.Reader  // Used when parsing a response.
+// New returns a client for baseURL, which must be an absolute https URL. A
+// path in baseURL, such as "/api", is kept as a prefix of every request path.
+func New(baseURL string, opts Options) (*Client, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("rest: parse base URL: %w", err)
 	}
-}
-
-// Creates a thread-safe REST client.
-func NewAPI(endpoint string) (API, error) {
-
-	a := &api{}
-	a.hdr = make(http.Header)
-	a.csr = make(chan *request)
-	a.cgr = make(chan *response)
-	a.ibr = 0
-	a.lms.init()
-
-	a.tmp.brd = bufio.NewReader(nil)
-
-	// Parsing the URL.
-	u, e := url.Parse(endpoint)
-
-	if e != nil {
-		return nil, e
-	}
-
-	a.hst = u.Hostname()
-	a.prt = u.Port()
-
-	if a.prt == "" {
-		a.prt = "443"
-	}
-
 	if u.Scheme != "https" {
-		return nil, fmt.Errorf("invalid scheme: %s", u.Scheme)
+		return nil, fmt.Errorf("rest: base URL scheme is %q, want https", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, errors.New("rest: base URL has no host")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("rest: base URL must not have a query or fragment")
+	}
+	if opts.MaxRetries < 0 {
+		return nil, errors.New("rest: MaxRetries must not be negative")
 	}
 
-	if len(a.hst) < 1 || len(a.prt) < 1 {
-		return nil, errors.New("this connection is not binded to a host")
-	}
-
-	go func() {
-
-		for csr := range a.csr {
-
-			rsp := &response{}
-			rsp.writte(a.send(csr))
-
-			a.cgr <- rsp
-		}
-	}()
-
-	// Setting the default headers.
-	a.hdr.Set("Host", u.Host)
-	a.hdr.Set("User-Agent", "github.com/pequin/rest")
-	a.hdr.Set("Content-Type", "application/json")
-	a.hdr.Set("Accept", "*/*")
-	a.hdr.Set("Connection", "keep-alive")
-
-	return a, nil
-}
-
-func (a *api) dial() error {
-
-	var err error
-
-	cfg := a.tlc
-	if cfg == nil {
-		cfg = &tls.Config{}
-	}
-
-	a.con, err = tls.Dial("tcp", a.host(), cfg)
-	if err != nil {
-		a.con = nil
-		return err
-	}
-
-	a.tmp.brd.Reset(a.con)
-
-	err = a.con.SetDeadline(time.Now().Add(dead))
-
-	if err != nil {
-		e := a.con.Close()
-		if e != nil {
-			return e
-		}
-	}
-
-	return err
-}
-
-func (a *api) host() string {
-	return net.JoinHostPort(a.hst, a.prt)
-}
-
-func (a *api) send(r *request) ([]byte, error) {
-
-	var err error
-
-	// waiting for interval between requests.
-	if a.crt > 0 && a.ibr > 0 {
-		time.Sleep(a.ibr)
-	}
-
-	// Waiting for the limit to expire.
-	if err = a.lms.wait(r.wgt); err != nil {
-		return nil, fmt.Errorf("path: %s, %w", r.url(), err)
-	}
-
-	// If the dial() was not called.
-	if a.con == nil {
-		err = a.dial()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	raw := r.encode()
-
-	if _, err = a.con.Write(raw); err != nil {
-
-		var ne net.Error
-		if !(errors.As(err, &ne) && ne.Timeout()) && !errors.Is(err, net.ErrClosed) {
-			return nil, err
-		}
-
-		// The connection timed out or was closed: dial again and resend once.
-		if err = a.dial(); err != nil {
-			return nil, err
-		}
-		if _, err = a.con.Write(raw); err != nil {
-			return nil, err
-		}
-	}
-
-	err = a.con.SetDeadline(time.Now().Add(dead))
-	if err != nil {
-		e := a.con.Close()
-		if e != nil {
-			return nil, e
-		}
-	}
-
-	a.tmp.rsp, err = http.ReadResponse(a.tmp.brd, nil)
+	lim, err := newLimiter(opts.Limits, opts.Interval)
 	if err != nil {
 		return nil, err
 	}
-	defer a.tmp.rsp.Body.Close()
 
-	if a.tmp.rsp.StatusCode != 200 {
-		// Drain the body so the next response starts at the right offset.
-		if _, err = io.Copy(io.Discard, a.tmp.rsp.Body); err != nil {
-			return nil, err
+	c := &Client{
+		base:       u,
+		http:       opts.HTTPClient,
+		header:     make(http.Header, len(opts.Header)+1),
+		timeout:    opts.Timeout,
+		maxRetries: opts.MaxRetries,
+		maxBackoff: opts.MaxBackoff,
+		sign:       opts.Sign,
+		limiter:    lim,
+	}
+	if c.http == nil {
+		c.http = &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
+	}
+	for k, v := range opts.Header {
+		k = http.CanonicalHeaderKey(k)
+		c.header[k] = append(c.header[k], v...)
+	}
+	if c.header.Get("User-Agent") == "" {
+		ua := opts.UserAgent
+		if ua == "" {
+			ua = DefaultUserAgent
 		}
-		return nil, fmt.Errorf("status:%d of the response to the request:%s", a.tmp.rsp.StatusCode, r.url())
+		c.header.Set("User-Agent", ua)
+	}
+	if c.timeout == 0 {
+		c.timeout = DefaultTimeout
+	}
+	if c.maxBackoff <= 0 {
+		c.maxBackoff = DefaultMaxBackoff
+	}
+	return c, nil
+}
+
+// Get sends a GET request for path with the given query and weight and
+// returns the response body. A nil query sends no query string.
+func (c *Client) Get(ctx context.Context, path string, query url.Values, weight int) ([]byte, error) {
+	resp, err := c.Do(ctx, &Request{Path: path, Query: query, Weight: weight})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// Do sends req and returns the response once it has been read in full.
+//
+// Do first waits until req.Weight fits into every limit, then sends the
+// request. Weight is counted for every attempt that is sent, whatever its
+// outcome, because servers count it too. A response outside 2xx is returned
+// as a *StatusError. Idempotent requests are retried as described in
+// Options.MaxRetries.
+func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
+	if req == nil {
+		return nil, errors.New("rest: nil request")
+	}
+	if err := c.limiter.check(req.Weight); err != nil {
+		return nil, err
 	}
 
-	a.crt++
+	method := req.method()
+	target := c.url(req)
+	retryable := req.Idempotent || isIdempotent(method)
 
-	return io.ReadAll(a.tmp.rsp.Body)
-
+	for attempt := 0; ; attempt++ {
+		resp, err := c.attempt(ctx, req, method, target)
+		if err == nil {
+			return resp, nil
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		if !retryable || attempt >= c.maxRetries || !shouldRetry(err) {
+			return nil, err
+		}
+		if err := sleep(ctx, c.backoff(attempt, err)); err != nil {
+			return nil, err
+		}
+	}
 }
 
-// Adds a request limit
-func (a *api) Limit(per time.Duration, limit int) {
+// attempt sends req once.
+func (c *Client) attempt(ctx context.Context, req *Request, method string, target *url.URL) (*Response, error) {
+	if err := c.limiter.wait(ctx, req.Weight); err != nil {
+		return nil, fmt.Errorf("rest: %s %s: wait for limit: %w", method, redact(target), err)
+	}
 
-	a.lms.add(per, limit)
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
 
+	hreq, err := c.newHTTPRequest(ctx, req, method, target)
+	if err != nil {
+		return nil, fmt.Errorf("rest: %s %s: %w", method, redact(target), err)
+	}
+
+	sent := time.Now()
+	hresp, err := c.http.Do(hreq)
+	if err != nil {
+		return nil, &transportError{method: method, url: redact(target), err: unwrapURLError(err)}
+	}
+	received := time.Now()
+	body, err := io.ReadAll(hresp.Body)
+	closeErr := hresp.Body.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return nil, &transportError{method: method, url: redact(target), err: err}
+	}
+
+	if date, err := http.ParseTime(hresp.Header.Get("Date")); err == nil {
+		c.limiter.syncClock(date, sent, received)
+	}
+
+	if hresp.StatusCode >= 200 && hresp.StatusCode < 300 {
+		return &Response{StatusCode: hresp.StatusCode, Header: hresp.Header, Body: body}, nil
+	}
+
+	serr := newStatusError(method, redact(target), hresp, body)
+	if serr.StatusCode == http.StatusTooManyRequests || serr.StatusCode == http.StatusTeapot {
+		// 418 is what some exchanges send when they ban an IP that kept
+		// ignoring 429. Either way no request should go out for a while.
+		c.limiter.pause(serr.RetryAfter)
+	}
+	return nil, serr
 }
 
-// Set interval between requests
-func (a *api) Interval(interval time.Duration) {
-
-	a.ibr = interval
+func (c *Client) newHTTPRequest(ctx context.Context, req *Request, method string, target *url.URL) (*http.Request, error) {
+	var body io.Reader
+	if req.Body != nil {
+		body = bytes.NewReader(req.Body)
+	}
+	hreq, err := http.NewRequestWithContext(ctx, method, target.String(), body)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range c.header {
+		hreq.Header[k] = append([]string(nil), v...)
+	}
+	for k, v := range req.Header {
+		hreq.Header[http.CanonicalHeaderKey(k)] = append([]string(nil), v...)
+	}
+	if req.Body != nil && hreq.Header.Get("Content-Type") == "" {
+		hreq.Header.Set("Content-Type", "application/json")
+	}
+	if c.sign != nil {
+		if err := c.sign(hreq); err != nil {
+			return nil, fmt.Errorf("sign: %w", err)
+		}
+	}
+	return hreq, nil
 }
 
-// Creates a new get request.
-func (a *api) Get(path string, weight int) Request {
-	r := &request{}
-	r.api = a
+// url joins the base URL, the request path and the query.
+func (c *Client) url(req *Request) *url.URL {
+	u := c.base.JoinPath(req.Path)
+	if len(req.Query) > 0 {
+		u.RawQuery = req.Query.Encode()
+	}
+	return u
+}
 
-	r.init(http.MethodGet, path, weight)
+// CloseIdleConnections closes keep-alive connections that are not in use.
+// The client stays usable and dials again when needed.
+func (c *Client) CloseIdleConnections() {
+	c.http.CloseIdleConnections()
+}
 
-	return r
+// backoff returns the pause before retry number attempt+1: the server's
+// Retry-After if it sent one, otherwise exponential backoff with full jitter.
+func (c *Client) backoff(attempt int, err error) time.Duration {
+	if serr, ok := errors.AsType[*StatusError](err); ok && serr.RetryAfter > 0 {
+		return serr.RetryAfter
+	}
+	ceiling := c.maxBackoff
+	if attempt < 30 {
+		ceiling = min(c.maxBackoff, baseBackoff<<attempt)
+	}
+	return rand.N(ceiling + 1)
+}
+
+func isIdempotent(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
+		return true
+	}
+	return false
+}
+
+// shouldRetry reports whether err is worth another attempt.
+func shouldRetry(err error) bool {
+	if serr, ok := errors.AsType[*StatusError](err); ok {
+		switch serr.StatusCode {
+		case http.StatusTooManyRequests, http.StatusInternalServerError,
+			http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		}
+		return false
+	}
+	_, ok := errors.AsType[*transportError](err)
+	return ok
+}
+
+// sleep waits for d or until ctx is done.
+func sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// parseRetryAfter reads a Retry-After value in seconds or as an HTTP date.
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if s, err := strconv.Atoi(v); err == nil {
+		if s < 0 {
+			return 0
+		}
+		return time.Duration(s) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return max(t.Sub(now), 0)
+	}
+	return 0
+}
+
+// redact drops the query from u, because it often carries API keys and
+// signatures that must not end up in logs.
+func redact(u *url.URL) string {
+	r := *u
+	r.RawQuery = ""
+	r.User = nil
+	return r.String()
+}
+
+// unwrapURLError strips the *url.Error that http.Client adds, since its
+// message repeats the full URL including the query.
+func unwrapURLError(err error) error {
+	if uerr, ok := errors.AsType[*url.Error](err); ok {
+		return uerr.Err
+	}
+	return err
 }
