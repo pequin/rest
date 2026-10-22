@@ -1,3 +1,17 @@
+// Copyright 2025 Vasiliy Vdovin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rest
 
 import (
@@ -13,26 +27,12 @@ import (
 	"time"
 )
 
-// Copyright 2025 Vasiliy Vdovin
-
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-
-// http://www.apache.org/licenses/LICENSE-2.0
-
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 const dead = time.Hour
 
 type API interface {
 
 	// Adds a request limit.
-	Limit(per time.Duration, max int)
+	Limit(per time.Duration, limit int)
 
 	// Creates a new get request.
 	Get(path string, weight int) Request
@@ -201,14 +201,13 @@ func (a *api) send(r *request) ([]byte, error) {
 		}
 
 		return nil, err
+	}
 
-	} else {
-		err = a.con.SetDeadline(time.Now().Add(dead))
-		if err != nil {
-			e := a.con.Close()
-			if e != nil {
-				return nil, e
-			}
+	err = a.con.SetDeadline(time.Now().Add(dead))
+	if err != nil {
+		e := a.con.Close()
+		if e != nil {
+			return nil, e
 		}
 	}
 
@@ -245,9 +244,9 @@ func (a *api) send(r *request) ([]byte, error) {
 }
 
 // Adds a request limit
-func (a *api) Limit(per time.Duration, max int) {
+func (a *api) Limit(per time.Duration, limit int) {
 
-	a.lms.add(per, max)
+	a.lms.add(per, limit)
 
 }
 
