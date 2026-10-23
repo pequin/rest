@@ -513,3 +513,29 @@ func TestParseRetryAfter(t *testing.T) {
 		}
 	}
 }
+
+func TestServerReportedWeightIsHonored(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		// Other clients on the same key have used up the hourly budget.
+		w.Header().Set("X-Used-Weight", "10")
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, "", Options{
+		Limits: []Limit{{Per: time.Hour, Weight: 10, UsedWeight: usedWeightHeader}},
+	})
+	if _, err := c.Get(t.Context(), "x", nil, 1); err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := c.Get(ctx, "x", nil, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Get err = %v, want context.DeadlineExceeded while waiting for the next window", err)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("server got %d requests, want 1: the reported weight was ignored", n)
+	}
+}

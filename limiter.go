@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -44,9 +45,10 @@ type limiter struct {
 // window is one Limit. used maps the index of a window on the server clock
 // (Unix time divided by per) to the weight reserved in it.
 type window struct {
-	per  time.Duration
-	max  int
-	used map[int64]int
+	per        time.Duration
+	max        int
+	used       map[int64]int
+	usedWeight func(http.Header) (int, bool) // Limit.UsedWeight; may be nil.
 }
 
 // index returns the window that the server time t falls into.
@@ -68,7 +70,12 @@ func newLimiter(limits []Limit, interval time.Duration) (*limiter, error) {
 		if lim.Per <= 0 || lim.Weight <= 0 {
 			return nil, fmt.Errorf("rest: invalid limit %d per %v: both must be positive", lim.Weight, lim.Per)
 		}
-		l.windows = append(l.windows, window{per: lim.Per, max: lim.Weight, used: make(map[int64]int)})
+		l.windows = append(l.windows, window{
+			per:        lim.Per,
+			max:        lim.Weight,
+			used:       make(map[int64]int),
+			usedWeight: lim.UsedWeight,
+		})
 	}
 	return l, nil
 }
@@ -176,6 +183,44 @@ func (l *limiter) syncClock(date, sent, received time.Time) {
 		}
 	}
 	l.lo, l.hi, l.synced = lo, hi, true
+}
+
+// syncUsed raises the weight counted in each window to what the server
+// reports in the headers h of a response to a request sent at sent and
+// answered at received (both local times). The server counted it at an
+// unknown moment in between, so the report applies to every window that
+// moment could fall into, just as reserve counts a request.
+func (l *limiter) syncUsed(h http.Header, sent, received time.Time) {
+	// The callbacks are caller code, so they run without the lock. The
+	// fields read here never change after newLimiter.
+	reported := make([]int, len(l.windows))
+	found := false
+	for i := range l.windows {
+		reported[i] = -1
+		if f := l.windows[i].usedWeight; f != nil {
+			if n, ok := f(h); ok && n >= 0 {
+				reported[i] = n
+				found = true
+			}
+		}
+	}
+	if !found {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	earliest, _ := l.bounds(sent)
+	_, latest := l.bounds(received)
+	for i, n := range reported {
+		if n < 0 {
+			continue
+		}
+		w := &l.windows[i]
+		for k := w.index(earliest); k <= w.index(latest); k++ {
+			w.used[k] = max(w.used[k], n)
+		}
+	}
 }
 
 // pause stops admitting requests for d, for example after a 429 response.

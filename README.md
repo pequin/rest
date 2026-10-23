@@ -65,7 +65,9 @@ are in the [package documentation](https://pkg.go.dev/github.com/pequin/rest).
 - **Weight limits.** Any number of fixed windows, such as 6000 per minute and
   50 per 10 seconds, plus an optional minimum interval between requests.
   Concurrent callers share one budget, and a waiting request never takes
-  weight from the window it is waiting out.
+  weight from the window it is waiting out. `Limit.UsedWeight` reads the
+  weight the server reports as used, so requests from other processes on the
+  same key or IP are counted too.
 - **Server clock alignment.** Windows follow the server clock estimated from
   `Date` response headers. While the estimate is coarse, a request is counted
   in every window it might fall into.
@@ -89,8 +91,9 @@ are in the [package documentation](https://pkg.go.dev/github.com/pequin/rest).
 - HTTPS only; the base URL must use the `https` scheme.
 - Windows are fixed, not a token bucket or a sliding log. That matches how
   most exchanges count weight but not every API.
-- The client does not read the server's own usage headers (such as
-  `X-MBX-USED-WEIGHT`); limits must be configured up front.
+- Limits must be configured up front. The server's usage headers (such as
+  `X-MBX-USED-WEIGHT-1M`) can raise the local count through
+  `Limit.UsedWeight`, but they never define or change a limit.
 - Response bodies are read fully into memory, so it is not meant for
   streaming or very large downloads.
 - `Date` headers have a resolution of one second, so windows of one second or

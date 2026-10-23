@@ -17,6 +17,8 @@ package rest
 import (
 	"context"
 	"errors"
+	"net/http"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -257,4 +259,59 @@ func TestLimiterCheck(t *testing.T) {
 	if err := l.check(1); err != nil {
 		t.Fatalf("check(1) = %v", err)
 	}
+}
+
+// usedWeightHeader reads a used-weight count the way an exchange client
+// would, for example from X-MBX-USED-WEIGHT-1M.
+func usedWeightHeader(h http.Header) (int, bool) {
+	n, err := strconv.Atoi(h.Get("X-Used-Weight"))
+	return n, err == nil
+}
+
+func TestLimiterSyncUsedRaisesCount(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		l := mustLimiter(t, 0, Limit{Per: time.Minute, Weight: 10, UsedWeight: usedWeightHeader})
+		start := time.Now()
+		if err := l.wait(t.Context(), 1); err != nil {
+			t.Fatal(err)
+		}
+
+		// Another process sharing the limit has used most of the window.
+		now := time.Now()
+		l.syncUsed(http.Header{"X-Used-Weight": {"9"}}, now, now)
+
+		if err := l.wait(t.Context(), 2); err != nil {
+			t.Fatal(err)
+		}
+		if got := time.Since(start); got != time.Minute {
+			t.Fatalf("request of weight 2 after the server reported 9 of 10 started at %v, want 1m", got)
+		}
+	})
+}
+
+func TestLimiterSyncUsedKeepsHigherLocalCount(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		l := mustLimiter(t, 0,
+			Limit{Per: time.Minute, Weight: 10, UsedWeight: usedWeightHeader},
+			Limit{Per: time.Hour, Weight: 100}, // No UsedWeight; must stay as it is.
+		)
+		start := time.Now()
+		if err := l.wait(t.Context(), 8); err != nil {
+			t.Fatal(err)
+		}
+
+		// Neither a lower report, nor a missing or negative one, frees weight
+		// that the local count still holds for requests in flight.
+		now := time.Now()
+		for _, v := range []string{"1", "", "-5"} {
+			l.syncUsed(http.Header{"X-Used-Weight": {v}}, now, now)
+		}
+
+		if err := l.wait(t.Context(), 3); err != nil {
+			t.Fatal(err)
+		}
+		if got := time.Since(start); got != time.Minute {
+			t.Fatalf("request of weight 3 after 8 of 10 started at %v, want 1m", got)
+		}
+	})
 }

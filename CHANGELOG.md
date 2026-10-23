@@ -48,6 +48,9 @@ body, err := client.Get(ctx, "/v1/ticker", url.Values{"symbol": {"BTCUSDT"}}, 1)
   with capped full-jitter backoff and support for `Retry-After`.
 - A pause of all requests after a 429 or 418 response.
 - Limit windows aligned to the server clock estimated from `Date` headers.
+- `Limit.UsedWeight` to count the weight the server reports in response
+  headers, such as `X-MBX-USED-WEIGHT-1M`, when it is higher than the local
+  count.
 - `Options.Sign` hook for request signing, `Options.Header`, `Options.Timeout`
   and `Options.HTTPClient`.
 - Tests, godoc examples, README and CI.

@@ -88,6 +88,16 @@ type Options struct {
 type Limit struct {
 	Per    time.Duration // Window length; must be positive.
 	Weight int           // Total weight allowed in one window; must be positive.
+
+	// UsedWeight, if set, reads the weight the server reports as used in the
+	// current window of this limit, such as Binance's X-MBX-USED-WEIGHT-1M
+	// header for a one-minute limit. It is called with the headers of every
+	// response, including error responses, and returns false when they carry
+	// no usable value. The client then counts at least the reported weight in
+	// that window, which covers requests sent by other clients or processes
+	// sharing the same limit. A report never lowers the local count, because
+	// requests still in flight are not part of it yet.
+	UsedWeight func(http.Header) (used int, ok bool)
 }
 
 // Client sends requests to one base URL and keeps them within the configured
@@ -242,6 +252,7 @@ func (c *Client) attempt(ctx context.Context, req *Request, method string, targe
 	if date, err := http.ParseTime(hresp.Header.Get("Date")); err == nil {
 		c.limiter.syncClock(date, sent, received)
 	}
+	c.limiter.syncUsed(hresp.Header, sent, received)
 
 	if hresp.StatusCode >= 200 && hresp.StatusCode < 300 {
 		return &Response{StatusCode: hresp.StatusCode, Header: hresp.Header, Body: body}, nil
